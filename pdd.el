@@ -136,82 +136,157 @@ non-nil then redirect the output to this function instead."
 
 (defclass pdd-cacher ()
   ((ttl
-    :initarg :ttl :initform 3 :type (or null t number function)
+    :initarg :ttl :initform 3 :type (or null number function)
     :documentation "Time-To-Live for cache entries in seconds.
-If nil, not cached. If t, entries are cached indefinitely.")
+If nil, not expired. If number, keep live for this seconds.
+If function, use cache every time when this return t.")
    (keys
     :initarg :keys  :initform nil :type (or symbol list function)
     :documentation "Configuration for generating the cache key.")
-   (storage
-    :initarg :storage :initform (make-hash-table :test 'equal)
+   (store
+    :initarg :store :initform (make-hash-table :test 'equal)
     :documentation "The storage backend for this cacher.
-By default, this is an hash-table or a symbol whose value is a hash-table.")))
+By default, this is an hash-table or a symbol whose value is a hash-table.
+This is also can be a directory string, that is, caching to local disk.")))
 
-(cl-defgeneric pdd-cacher-get (cacher key)
-  "Get item of KEY from CACHER."
+(cl-defgeneric pdd-cacher-get (_cacher _key)
+  "Get item of KEY from CACHER.
+CACHER can be a hash table, a directory string or a cacher instance."
+  (:method ((table hash-table) key)
+           "When store is hash TABLE, cache as (value . ttl)."
+           (gethash key table))
+  (:method ((directory string) key)
+           "When store is string, take it as DIRECTORY, and cache to file."
+           (unless (file-directory-p directory)
+             (user-error "Cache directory `%s' is not found" directory))
+           (when-let* ((file (cl-find-if (lambda (item)
+                                           (string-match-p (format "^%s:[0-9.]+\\.cache$" key) item))
+                                         (directory-files directory)))
+                       (pos (cl-search ":" file :from-end t))
+                       (ttl (string-to-number (substring file (+ pos 1) (- (length file) 5)))))
+             (cons (lambda ()
+                     (with-temp-buffer
+                       (insert-file-contents-literally (expand-file-name file directory))
+                       (set-buffer-multibyte nil)
+                       (buffer-string)))
+                   (unless (zerop ttl) ttl))))
   (:method ((cacher pdd-cacher) key)
-           (setq key (pdd-cacher-key cacher key))
-           (with-slots (ttl storage) cacher
-             (when-let* ((store (if (symbolp storage) (symbol-value storage) storage))
-                         (entry (gethash key store)))
-               (if (or (eq ttl t) ; Cache forever if TTL is t
-                       (null (cdr entry)) ; Also if expires-at is nil
-                       (> (cdr entry) (float-time)))
-                   (progn (pdd-log 'cacher "Hit: %S" key) (car entry))
-                 (pdd-log 'cacher "Stale (TTL): %S" key)
-                 (remhash key store)
-                 nil)))))
+           "Dispatch KEY to specific storage according CACHER."
+           (with-slots (ttl store) cacher
+             (let ((real-store (if (symbolp store) (symbol-value store) store))
+                   (real-key (pdd-cacher-key cacher key)))
+               (if (and (functionp ttl) (not (pdd-funcall ttl (list key cacher)))) ; 0. (ttl) function t
+                   (pdd-cacher-clear real-store real-key)
+                 (when real-store
+                   (pdd-cacher-get real-store real-key))))))
+  (:method :around (cacher key)
+           (if (cl-typep cacher 'pdd-cacher)
+               (cl-call-next-method cacher key)
+             (pdd-log 'cacher "GET: [%s] %s" (type-of cacher) key)
+             (pcase-let* ((real-key (pdd-cacher-key cacher key))
+                          (`(,value . ,ttl) (cl-call-next-method cacher real-key)))
+               (if value
+                   (if (or (null ttl) ; 1. (ttl) nil for no-expired
+                           (and (numberp ttl) (> ttl (float-time)))) ; 2. (ttl) valid time
+                       (progn
+                         (pdd-log 'cacher "HIT: %s" key)
+                         (if (functionp value) (funcall value) value)) ; defer with function
+                     (pdd-log 'cacher "Expired!")
+                     (pdd-cacher-clear cacher key) nil)
+                 (pdd-log 'cacher "NotFound.") nil))))
+  (user-error "Invalid cacher"))
 
-(cl-defgeneric pdd-cacher-put (cacher key value &optional ttl)
+(cl-defgeneric pdd-cacher-put (_cacher _key _value &optional _ttl)
   "Put VALUE into CACHER with KEY.
-Use TTL explicitly when it is not nil."
+CACHER can be a hash table, a directory string or a cacher instance."
+  (:method ((table hash-table) key value &optional ttl)
+           (puthash key (cons value ttl) table))
+  (:method ((directory string) key value &optional ttl)
+           (unless (file-exists-p directory)
+             (make-directory directory t))
+           (let ((name (format "%s:%s.cache" key (or ttl "000")))
+                 (coding-system-for-write 'no-conversion)
+                 (inhibit-message t)
+                 (message-log-max nil))
+             (write-region value nil (expand-file-name name directory))))
   (:method ((cacher pdd-cacher) key value &optional (ttl nil ttl-s))
-           (setq key (pdd-cacher-key cacher key))
            (let* ((ttl (if ttl-s ttl (oref cacher ttl)))
-                  (ttl (if (functionp ttl) (pdd-funcall ttl (list value)) ttl))
-                  (storage (oref cacher storage))
-                  (store (if (symbolp storage) (symbol-value storage) storage)))
-             (if (gethash key store)
-                 (progn (remhash key store) (pdd-log 'cacher "Update: %S" key))
-               (pdd-log 'cacher "Add: %S" key))
-             ;; Cache only when ttl is a number or t
-             (when ttl
-               (puthash key (cons value (if (numberp ttl) (+ ttl (float-time)))) store))
-             ;; Any better strategy to clear the expired items?
-             (if (< (random 1000) 50) (pdd-cacher-clear cacher))
-             value)))
+                  (ttl (if (numberp ttl) (+ ttl (float-time)))) ; function or others: nil
+                  (store (oref cacher store))
+                  (real-store (if (symbolp store) (symbol-value store) store)))
+             (pdd-cacher-put real-store (pdd-cacher-key cacher key) value ttl)))
+  (:method :around (cacher key value &optional (ttl nil ttl-s))
+           (cl-assert (or (null ttl) (numberp ttl) (functionp ttl)))
+           (if (cl-typep cacher 'pdd-cacher)
+               (apply #'cl-call-next-method cacher key `(,value ,@(if ttl-s (list ttl))))
+             (pdd-cacher-clear cacher key)
+             (pdd-log 'cacher "PUT: [%s] %s" (type-of cacher) key)
+             (cl-call-next-method cacher (pdd-cacher-key cacher key) value ttl)
+             value))
+  (user-error "Invalid cacher"))
 
-(cl-defgeneric pdd-cacher-clear (cacher &optional key)
+(cl-defgeneric pdd-cacher-clear (_cacher &optional _key)
   "Clear cache entries from CACHER.
+CACHER can be a hash table, a directory string or a cacher instance.
 If KEY is t, clear all entries. If it is nil, clear invalid entries.
 Otherwise, clear only the item."
   (:method ((store hash-table) &optional key)
-           (cond ((eq key t) ; Clear all
-                  (pdd-log 'cacher "Clear ALL entries.")
+           (cond ((eq key t) ; all
                   (clrhash store))
-                 ((null key) ; Clear invalid
-                  (pdd-log 'cacher "Clear INVALID entries.")
+                 ((null key) ; expired
                   (maphash (lambda (k v)
                              (when (< (cdr v) (float-time))
                                (remhash k store)))
                            store))
-                 (t (pdd-log 'cacher "Clear ENTRY: %S" key)
-                    (remhash key store))))
+                 (t (remhash key store))))
+  (:method ((directory string) &optional key)
+           (when (file-directory-p directory)
+             (cond ((eq key t) ; all
+                    (cl-loop for file in (directory-files directory t)
+                             if (string-match-p ":[0-9.]+\\.cache$" file)
+                             do (delete-file file)))
+                   ((null key) ; expired
+                    (cl-loop for file in (directory-files directory t)
+                             if (and (string-match ":\\([0-9.]+\\)\\.cache$" file)
+                                     (let ((ttl (string-to-number (match-string 1 file))))
+                                       (and (not (zerop ttl)) (< ttl (float-time)))))
+                             do (delete-file file)))
+                   (t (when-let*
+                          ((fn (lambda (item) (string-match-p (format "^%s:[0-9.]+\\.cache$" key) item)))
+                           (file (cl-find-if fn (directory-files directory))))
+                        (delete-file (expand-file-name file directory)))))))
   (:method ((cacher pdd-cacher) &optional key)
-           (with-slots (storage) cacher
-             (let ((store (if (symbolp storage) (symbol-value storage) storage))
-                   (real-key (if (memq key '(nit t)) key
-                               (pdd-cacher-key cacher key))))
-               (pdd-cacher-clear store real-key)))))
+           (with-slots (store) cacher
+             (let ((real-store (if (symbolp store) (symbol-value store) store)))
+               (pdd-cacher-clear real-store (pdd-cacher cacher key)))))
+  (:method :around (cacher &optional key)
+           (if (cl-typep cacher 'pdd-cacher)
+               (cl-call-next-method cacher key)
+             (cond ((eq key t)
+                    (pdd-log 'cacher "DEL: all"))
+                   ((null key)
+                    (pdd-log 'cacher "DEL: invalid"))
+                   (t
+                    (pdd-log 'cacher "DEL: [%s] %s" (type-of cacher) key)
+                    (setq key (pdd-cacher-key cacher key))))
+             (cl-call-next-method cacher key)))
+  (user-error "Invalid cacher"))
 
-(cl-defgeneric pdd-cacher-key (cacher key)
+(cl-defgeneric pdd-cacher-key (_cacher key)
   "Return the real storage KEY for CACHER."
-  (:method ((_cacher pdd-cacher) key) key)
-  (:method :around ((cacher pdd-cacher) key)
-           (with-slots (keys) cacher
-             (if (functionp keys)
-                 (pdd-funcall keys (list key))
-               (cl-call-next-method cacher key)))))
+  (:method ((_ string) key)
+           (if (or (null key) (stringp key)) key
+             (secure-hash 'md5 (prin1-to-string key))))
+  (:method ((cacher pdd-cacher) key)
+           (with-slots (keys store) cacher
+             (let ((real-store (if (symbolp store)
+                                   (symbol-value store)
+                                 store))
+                   (real-key (if (functionp keys) ; override the default logic
+                                 (pdd-funcall keys (list key cacher))
+                               (cl-call-next-method cacher key))))
+               (pdd-cacher-key real-store real-key))))
+  key)
 
 (defvar pdd-active-cacher nil)
 
@@ -634,6 +709,7 @@ the built-in transformers unless you fully understand the consequences.")
     pdd-transform-resp-verbose
     pdd-transform-resp-headers
     pdd-transform-resp-cookies
+    pdd-transform-resp-cacher
     pdd-transform-resp-decode
     pdd-transform-resp-body)
   "List of functions that process and transform the response buffer sequentially.
@@ -1876,23 +1952,29 @@ If JAR is nil, operates on the default cookie jar."
 
 (cl-defmethod pdd-cacher-key ((cacher pdd-cacher) (request pdd-request))
   "Return the real CACHER key for REQUEST."
-  (with-slots (keys) cacher
-    (cl-loop with items = (if keys (ensure-list keys) '(url method headers data))
-             for item in (delete-dups items)
-             if (eq item 'data) do (setq item 'datas)
-             if (and (slot-exists-p request item) ; :keys '(url method data)
-                     (slot-value request item))
-             collect (let ((v (slot-value request item)))
-                       (if (eq item 'datas) (secure-hash 'md5 v) v))
-             else if (consp item) ; :keys '((data . a) (data . (b . c)) (headers . user-agent))
-             collect (cl-labels
-                         ((alist-gv (key alist)
-                            (if (consp key)
-                                (alist-gv (cdr key)
-                                          (alist-get (car key) alist nil nil #'pdd-ci-equal))
-                              (alist-get key alist nil nil #'pdd-ci-equal))))
-                       (alist-gv (cdr item) (slot-value request (car item))))
-             else collect item)))
+  (with-slots (keys store) cacher
+    (let ((rkey (oref cacher keys)))
+      (when (functionp (car (ensure-list rkey)))
+        (setq rkey (pdd-funcall (car (ensure-list rkey)) (list request cacher))))
+      (setq rkey
+            (cl-loop with items = (if rkey (ensure-list rkey) '(url method headers data))
+                     for item in (delete-dups items)
+                     if (eq item 'data) do (setq item 'datas)
+                     if (and (slot-exists-p request item) ; :keys '(url method data)
+                             (slot-value request item))
+                     collect (let ((v (slot-value request item)))
+                               (if (eq item 'datas) (secure-hash 'md5 v) v))
+                     else if (consp item) ; :keys '((data . a) (data . (b . c)) (headers . user-agent))
+                     collect (cl-labels
+                                 ((alist-gv (rkey alist)
+                                    (if (consp rkey)
+                                        (alist-gv (cdr rkey)
+                                                  (alist-get (car rkey) alist nil nil #'pdd-ci-equal))
+                                      (alist-get rkey alist nil nil #'pdd-ci-equal))))
+                               (alist-gv (cdr item) (slot-value request (car item))))
+                     else collect item))
+      (if (and (consp rkey) (not (cdr rkey))) (setq rkey (car rkey)))
+      (pdd-cacher-key (if (symbolp store) (symbol-value store) store) rkey))))
 
 ;; Request
 
@@ -1919,7 +2001,6 @@ If JAR is nil, operates on the default cookie jar."
             `(lambda ,args
                (pdd-log 'done "enter")
                (let ((task   (oref ,request-ref task))
-                     (cacher (oref ,request-ref cache))
                      (queue  (oref ,request-ref queue)))
                  (unwind-protect
                      (condition-case err1
@@ -1928,8 +2009,6 @@ If JAR is nil, operates on the default cookie jar."
                                (current-buffer)) ; don't raise error when original buffer killed
                            (prog1
                                (let ((result (,(or original-done 'identity) ,@args)))
-                                 (when cacher ; put cache if necessary
-                                   (pdd-cacher-put cacher ,request-ref result))
                                  (if (not (pdd-task-p task))
                                      result
                                    (pdd-log 'task "TASK DONE:  %s" ,captured-url)
@@ -2121,14 +2200,29 @@ If JAR is nil, operates on the default cookie jar."
       (oset request proxy proxy))))
 
 (cl-defmethod pdd-transform-req-cacher ((request pdd-request))
-  "Normalize cacher setting for current REQUEST."
+  "Normalize cacher setting for current REQUEST.
+
+Examples:
+
+  :cache 10
+  :cache (lambda () (> (random 10) 5))
+  :cache \\='(10 url)
+  :cache \\='(10 url (data . xxx) (store . \"~/vvv\"))
+  :cache (list (lambda () (> (random 10) 5))
+               (lambda (req) (oref req url))
+               \\='(store . my-hash-table))"
   (with-slots (data cache) request
-    (if (or (eq cache t) (functionp cache) (numberp cache))
-        (setf cache (pdd-cacher :ttl cache :storage pdd-shared-cache-storage))
-      (when (consp cache)
-        (if-let* ((keys (cdr cache)))
-            (setf cache (pdd-cacher :ttl (car cache) :keys keys :storage pdd-shared-cache-storage))
-          (setf cache (pdd-cacher :ttl (car cache) :storage pdd-shared-cache-storage)))))))
+    (if (eq cache t)
+        (setf cache (pdd-cacher :store pdd-shared-cache-storage))
+      (if (or (functionp cache) (numberp cache))
+          (setf cache (pdd-cacher :ttl cache :store pdd-shared-cache-storage))
+        (when (consp cache)
+          (let* ((ttl (car cache))
+                 (storage pdd-shared-cache-storage)
+                 (keys (cl-loop for item in (cdr cache)
+                                if (eq (car-safe item) 'store) do (setq storage (cdr item))
+                                else collect item)))
+            (setf cache (pdd-cacher :ttl ttl :keys keys :store storage))))))))
 
 (cl-defmethod pdd-transform-req-others ((request pdd-request))
   "Other changes should be made for REQUEST."
@@ -2215,6 +2309,8 @@ Delay the logic after :init to avoid unnecessary output."
              do (pdd-log 'req ".%s" (symbol-name transformer))
              do (funcall transformer request))))
 
+(defvar-local pdd-cached-p nil)
+
 (cl-defmethod pdd :around ((backend pdd-http-backend) &rest args)
   "The common logics before or after the http request for BACKEND.
 ARGS should a request instances or keywords to build the request."
@@ -2226,32 +2322,35 @@ ARGS should a request instances or keywords to build the request."
                 (if (cl-typep (car args) 'pdd-request)
                     (car args)
                   (apply #'pdd-make-request backend args)))
-          (with-slots (sync init process task queue cache abort-flag begtime) request
-            (if-let* ((entry (and cache (pdd-cacher-get cache request))))
-                (progn
-                  (pdd-log 'pdd:around "hit cache...")
-                  (if sync entry (pdd-resolve entry)))
-              (let ((real-queue (if (functionp queue)
-                                    (pdd-funcall queue (list request))
-                                  queue)))
-                (if (or sync (null real-queue) (memq task (oref real-queue running))) ; for retry logic
-                    (let ((result (progn
-                                    (pdd-log 'pdd:around "dispatch to %s..." backend)
-                                    (if init (funcall init))
-                                    (setf abort-flag nil begtime (float-time))
-                                    (cl-call-next-method backend :request request))))
-                      (if sync result (setf process result) task))
-                  (pdd-log 'pdd:around "queue...")
-                  (let* ((context (pdd--capture-dynamic-context))
-                         (callback (lambda ()
-                                     (pdd--with-restored-dynamic-context context
-                                       (pdd-log 'pdd:around "dispatch to %s..." backend)
-                                       (if init (funcall init))
-                                       (setf abort-flag nil begtime (float-time))
-                                       (setf process (cl-call-next-method backend :request request))))))
-                    (pdd-log 'queue "acquire queue: %s" real-queue)
-                    (pdd-queue-acquire real-queue (cons task (lambda () (run-at-time 0 nil callback))))
-                    task))))))
+          (with-slots (sync init done process task queue cache abort-flag begtime) request
+            (let ((real-queue (if (functionp queue)
+                                  (pdd-funcall queue (list request))
+                                queue))
+                  (real-next (lambda ()
+                               (if-let* ((entry (and cache (pdd-cacher-get cache request))))
+                                   (with-temp-buffer
+                                     (insert entry)
+                                     (setq pdd-cached-p t)
+                                     (pdd-funcall done (pdd-transform-response request)))
+                                 (cl-call-next-method backend :request request)))))
+              (if (or sync (null real-queue) (memq task (oref real-queue running))) ; for retry logic
+                  (let ((result (progn
+                                  (pdd-log 'pdd:around "dispatch to %s..." backend)
+                                  (if init (funcall init))
+                                  (setf abort-flag nil begtime (float-time))
+                                  (funcall real-next))))
+                    (if sync result (setf process result) task))
+                (pdd-log 'pdd:around "queue...")
+                (let* ((context (pdd--capture-dynamic-context))
+                       (callback (lambda ()
+                                   (pdd--with-restored-dynamic-context context
+                                     (pdd-log 'pdd:around "dispatch to %s..." backend)
+                                     (if init (funcall init))
+                                     (setf abort-flag nil begtime (float-time))
+                                     (setf process (funcall real-next))))))
+                  (pdd-log 'queue "acquire queue: %s" real-queue)
+                  (pdd-queue-acquire real-queue (cons task (lambda () (run-at-time 0 nil callback))))
+                  task)))))
       (error (if request
                  (funcall (oref request fail) err)
                (message "Caught error during pdd:around: %s" err))))))
@@ -2269,7 +2368,7 @@ ARGS should a request instances or keywords to build the request."
   pdd-default-response-transformers)
 
 (cl-defmethod pdd-transform-resp-init (_request)
-  "The most first check, if no problems clean newlines and set `pdd-resp-mark'."
+  "Most first phase for dealing response."
   (widen) ; in case that the buffer is narrowed
   (goto-char (point-min))
   (unless (re-search-forward "\n\n\\|\r\n\r\n" nil t)
@@ -2312,6 +2411,14 @@ ARGS should a request instances or keywords to build the request."
                (when-let* ((cookie (pdd-parse-set-cookie v t)))
                  (pdd-cookie-jar-put cookie-jar (or (plist-get cookie :domain) domain) cookie)))
       (pdd-cookie-jar-clear cookie-jar))))
+
+(cl-defmethod pdd-transform-resp-cacher (request)
+  "Cache the response content for REQUEST if necessary."
+  (unless pdd-cached-p
+    (when-let* ((cacher (oref request cache)))
+      (save-restriction
+        (widen)
+        (pdd-cacher-put cacher request (buffer-string))))))
 
 (cl-defmethod pdd-transform-resp-decode (_request)
   "Decoding buffer automatically."

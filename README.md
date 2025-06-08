@@ -304,7 +304,7 @@ Cookies auto management with `cookie-jar` ([more](docs/cookie-jar.md)):
 Use `:cache` to enable cache support for current request ([more](docs/cacher.md)):
 ```emacs-lisp
 (pdd "https://httpbin.org/ip" :cache 5)
-(pdd "https://httpbin.org/ip" :cache (pdd-cacher :ttl 5 :keys '(url method) :storage 'xxx))
+(pdd "https://httpbin.org/ip" :cache (pdd-cacher :ttl 5 :keys '(url method)))
 ```
 
 Use `:verbose` to inspect the request/response headers:
